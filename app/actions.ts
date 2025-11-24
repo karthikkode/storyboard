@@ -283,7 +283,7 @@ async function runStep3_AnalyzeAndGeneratePrompts(
 
   const sceneList = scenes.map(s => `Scene ${s.scene}: "${s.script}"`).join('\n');
 
-const prompt = `You are an expert storyboard prompt generator.
+  const prompt = `You are an expert storyboard prompt generator.
 
 FIRST, analyze this FULL SCRIPT to determine its overall 'backdrop' and 'tone':
 --- FULL SCRIPT ---
@@ -573,14 +573,13 @@ async function runStep5_CreateVideo(
 // --- 5. THE MAIN SERVER ACTION ---
 export async function generateStoryboard(formData: FormData) {
   try {
-    // // ===================================================================
-    // // =================== DEBUG: SKIP TO STEP 5 =========================
-    // // ===================================================================
-    // console.warn('!!!!!!!!!! RUNNING IN DEBUG MODE: SKIPPING TO STEP 5 !!!!!!!!!!!');
+    // ===================================================================
+    // =================== DEBUG: SKIP TO STEP 4 =========================
+    // ===================================================================
+    // console.warn('!!!!!!!!!! RUNNING IN DEBUG MODE: SKIPPING TO STEP 4 !!!!!!!!!!!');
 
-    // const debugJobId = 'saraswatiriver_1762823839828';
-    // const debugGcsAudioUri = `gs://${audioBucketName}/saraswatiriver_1762823839828.wav`;
-    // const debugChunkedJsonFile = `${debugJobId}.json`;
+    // const debugJobId = 'indiairan_1763582374752';
+    // const debugChunkedJsonFile = 'indiairan_1763582374752.json';
 
     // console.log(`DEBUG: Fetching chunked JSON: gs://${chunkedBucketName}/${debugChunkedJsonFile}`);
 
@@ -594,15 +593,20 @@ export async function generateStoryboard(formData: FormData) {
     //   throw new Error('Debug JSON file was empty or invalid.');
     // }
 
-    // console.log('DEBUG: Jumping directly to Step 5...');
-    // const debugVideoUrl = await runStep5_CreateVideo(debugJobId, debugScenes, debugGcsAudioUri);
+    // const debugGcsAudioUri = `gs://${audioBucketName}/${debugJobId}.wav`;
+
+    // console.log('DEBUG: Jumping directly to Step 4...');
+    // const debugFinalScenes = await runStep4_GenerateImages(debugJobId, debugScenes);
+
+    // console.log('DEBUG: Jumping to Step 5...');
+    // const debugVideoUrl = await runStep5_CreateVideo(debugJobId, debugFinalScenes, debugGcsAudioUri);
 
     // console.log('--- DEBUG STORYBOARD PIPELINE COMPLETE ---');
-    // return { scenes: debugScenes, video: debugVideoUrl };
+    // return { scenes: debugFinalScenes, video: debugVideoUrl };
 
-    // // ===================================================================
-    // // ================= END DEBUG BLOCK =================================
-    // // ===================================================================
+    // ===================================================================
+    // ================= END DEBUG BLOCK =================================
+    // ===================================================================
 
     // --- PRODUCTION FLOW (unreachable while debug block returns above) ---
     const file = formData.get('audioFile') as File;
