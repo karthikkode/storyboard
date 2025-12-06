@@ -566,42 +566,40 @@ async function runStep5_CreateVideo(
     throw error;
   } finally {
     console.log(`Cleaning up temp directory: ${TEMP_DIR}`);
-    // await fs.rm(TEMP_DIR, { recursive: true, force: true });
+    await fs.rm(TEMP_DIR, { recursive: true, force: true });
   }
 }
 
-// --- 5. THE MAIN SERVER ACTION ---
+// --- 6. THE MAIN SERVER ACTION ---
 export async function generateStoryboard(formData: FormData) {
   try {
     // ===================================================================
-    // =================== DEBUG: SKIP TO STEP 4 =========================
+    // =================== DEBUG: START FROM STEP 5 =========================
     // ===================================================================
-    // console.warn('!!!!!!!!!! RUNNING IN DEBUG MODE: SKIPPING TO STEP 4 !!!!!!!!!!!');
+    // console.warn('!!!!!!!!!! RUNNING IN DEBUG MODE: STARTING FROM STEP 5 !!!!!!!!!!!');
 
-    // const debugJobId = 'indiairan_1763582374752';
-    // const debugChunkedJsonFile = 'indiairan_1763582374752.json';
+    // const debugJobId = 'final_1764653265533';
+    // const debugChunkedJsonFile = 'final_1764653265533.json';
 
     // console.log(`DEBUG: Fetching chunked JSON: gs://${chunkedBucketName}/${debugChunkedJsonFile}`);
 
     // const jsonFile = storage.bucket(chunkedBucketName).file(debugChunkedJsonFile);
     // const [jsonData] = await jsonFile.download();
 
-    // const debugScenes = JSON.parse(jsonData.toString('utf-8')) as Scene[];
-    // console.log(`DEBUG: Loaded ${debugScenes.length} scenes from JSON.`);
+    // const debugFinalScenes = JSON.parse(jsonData.toString('utf-8')) as Scene[];
+    // console.log(`DEBUG: Loaded ${debugFinalScenes.length} scenes from JSON.`);
 
-    // if (debugScenes.length === 0) {
+    // if (debugFinalScenes.length === 0) {
     //   throw new Error('Debug JSON file was empty or invalid.');
     // }
 
+    // // We need the audio file. Assuming .wav. If your file is .mp3, change this line.
     // const debugGcsAudioUri = `gs://${audioBucketName}/${debugJobId}.wav`;
 
-    // console.log('DEBUG: Jumping directly to Step 4...');
-    // const debugFinalScenes = await runStep4_GenerateImages(debugJobId, debugScenes);
-
-    // console.log('DEBUG: Jumping to Step 5...');
+    // console.log('DEBUG: Running Step 5 (Create Video)...');
     // const debugVideoUrl = await runStep5_CreateVideo(debugJobId, debugFinalScenes, debugGcsAudioUri);
 
-    // console.log('--- DEBUG STORYBOARD PIPELINE COMPLETE ---');
+    // console.log('--- DEBUG STORYBOARD PIPELINE COMPLETE (Step 5) ---');
     // return { scenes: debugFinalScenes, video: debugVideoUrl };
 
     // ===================================================================
