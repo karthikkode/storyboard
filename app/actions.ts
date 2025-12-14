@@ -63,7 +63,7 @@ const videoBucketName = process.env.VIDEO_BUCKET_NAME!;
 const TEXT_MODEL = 'gemini-2.5-pro';
 const IMAGE_MODEL = 'imagen-4.0-ultra-generate-001';
 const DEFAULT_AR = '16:9';
-const SLEEP_BETWEEN_IMAGES_SEC = 30;
+const SLEEP_BETWEEN_IMAGES_SEC = 5;
 
 // --- 2. HELPER FUNCTIONS ---
 
@@ -114,6 +114,100 @@ async function downloadGCSFile(bucketName: string, fileName: string, localPathSt
 }
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+// --- RETRY HELPER WITH EXPONENTIAL BACKOFF ---
+async function retryWithBackoff<T>(
+  fn: () => Promise<T>,
+  options: {
+    maxRetries?: number;
+    initialDelayMs?: number;
+    maxDelayMs?: number;
+    shouldRetry?: (error: any) => boolean;
+  } = {}
+): Promise<T> {
+  const {
+    maxRetries = 3,
+    initialDelayMs = 1000,
+    maxDelayMs = 30000,
+    shouldRetry = () => true,
+  } = options;
+
+  let lastError: any;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error: any) {
+      lastError = error;
+
+      // Check if we should retry this error
+      if (!shouldRetry(error)) {
+        console.log(`Non-retryable error encountered: ${error?.message || error}`);
+        throw error;
+      }
+
+      // If this was the last attempt, throw the error
+      if (attempt === maxRetries) {
+        console.error(`All ${maxRetries + 1} attempts failed.`);
+        throw error;
+      }
+
+      // Calculate delay with exponential backoff and jitter
+      const baseDelay = Math.min(initialDelayMs * Math.pow(2, attempt), maxDelayMs);
+      const jitter = Math.random() * 0.3 * baseDelay; // 0-30% jitter
+      const delayMs = baseDelay + jitter;
+
+      console.log(`Attempt ${attempt + 1}/${maxRetries + 1} failed: ${error?.message || error}`);
+      console.log(`Retrying in ${(delayMs / 1000).toFixed(1)}s...`);
+
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
+// --- TEMP FILE TRACKING FOR RESUME CAPABILITY ---
+async function getTempProgressPath(jobId: string): Promise<string> {
+  const TEMP_DIR = path.join(process.cwd(), 'temp');
+  await fs.mkdir(TEMP_DIR, { recursive: true });
+  return path.join(TEMP_DIR, `${jobId}_progress.json`);
+}
+
+async function saveProgressToTempFile(jobId: string, scenes: Scene[]): Promise<void> {
+  const tempPath = await getTempProgressPath(jobId);
+  try {
+    await fs.writeFile(tempPath, JSON.stringify(scenes, null, 2), 'utf-8');
+    console.log(`Progress saved to temp file: ${tempPath}`);
+  } catch (error) {
+    console.error(`Failed to save progress to temp file:`, error);
+    // Don't throw - this is a backup mechanism
+  }
+}
+
+async function loadProgressFromTempFile(jobId: string): Promise<Scene[] | null> {
+  const tempPath = await getTempProgressPath(jobId);
+  try {
+    await fs.access(tempPath, FS.F_OK);
+    const content = await fs.readFile(tempPath, 'utf-8');
+    const scenes = JSON.parse(content) as Scene[];
+    console.log(`Loaded progress from temp file: ${tempPath} (${scenes.length} scenes)`);
+    return scenes;
+  } catch (error) {
+    // File doesn't exist or is invalid - not an error, just no progress to resume
+    return null;
+  }
+}
+
+async function cleanupTempFile(jobId: string): Promise<void> {
+  const tempPath = await getTempProgressPath(jobId);
+  try {
+    await fs.unlink(tempPath);
+    console.log(`Cleaned up temp file: ${tempPath}`);
+  } catch (error) {
+    // Ignore errors - file might not exist
+  }
+}
 
 // --- 3. TYPES ---
 type WordInfo = { word: string; startTime: number; endTime: number };
@@ -421,62 +515,279 @@ async function runStep4_GenerateImages(
 ): Promise<Scene[]> {
   console.log(`RUNNING: Step 4 Image Generation for job ${jobId}...`);
 
-  const finalScenes: Scene[] = [];
+  // Try to load existing progress from temp file
+  let workingScenes = await loadProgressFromTempFile(jobId);
 
-  for (const scene of scenesWithPrompts) {
+  if (workingScenes) {
+    console.log(`Resuming from previous progress. Found ${workingScenes.length} scenes.`);
+    // Verify the loaded scenes match the input scenes count
+    if (workingScenes.length !== scenesWithPrompts.length) {
+      console.warn(`Scene count mismatch. Starting fresh.`);
+      workingScenes = [...scenesWithPrompts];
+    }
+  } else {
+    console.log(`No previous progress found. Starting fresh.`);
+    workingScenes = [...scenesWithPrompts];
+  }
+
+  // Determine which scenes need image generation
+  const scenesToProcess: number[] = [];
+  for (let i = 0; i < workingScenes.length; i++) {
+    const scene = workingScenes[i];
+    // Skip if already has a valid image URL (not null, not error)
+    if (!scene.image_url || scene.image_url.startsWith('ERROR:')) {
+      scenesToProcess.push(i);
+    }
+  }
+
+  console.log(`Total scenes: ${workingScenes.length}, Scenes to process: ${scenesToProcess.length}`);
+
+  for (const sceneIndex of scenesToProcess) {
+    const scene = workingScenes[sceneIndex];
+
     if (!scene.prompt || scene.prompt.startsWith('Failed to generate')) {
       console.log(`Skipping Scene ${scene.scene}: No valid prompt provided.`);
-      finalScenes.push(scene);
       continue;
     }
 
-    console.log(`Generating image for Scene ${scene.scene}...`);
+    console.log(`\n=== Processing Scene ${scene.scene} (${sceneIndex + 1}/${workingScenes.length}) ===`);
+
+    // Helper function to determine if error is retryable
+    const isRetryableError = (error: any): boolean => {
+      const errorMsg = error?.message || String(error);
+
+      // Don't retry on safety/policy blocks
+      if (errorMsg.includes('safety') || errorMsg.includes('blocked') || errorMsg.includes('policy')) {
+        return false;
+      }
+
+      // Don't retry on authentication errors
+      if (errorMsg.includes('authentication') || errorMsg.includes('unauthorized')) {
+        return false;
+      }
+
+      // Retry on rate limits, timeouts, and transient errors
+      return true;
+    };
+
     try {
-      const request = {
-        prompt: scene.prompt,
-        config: { numberOfImages: 1, aspectRatio: DEFAULT_AR },
-        safetySettings: [
-          { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-          { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
-          { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
-          { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
-        ],
-      } as const;
+      // Use retry mechanism for image generation
+      const imageUrl = await retryWithBackoff(
+        async () => {
+          console.log(`Generating image for Scene ${scene.scene}...`);
 
-      const imgResult = await googleAI.models.generateImages({ model: IMAGE_MODEL, ...request });
+          const request = {
+            prompt: scene.prompt!,  // Non-null assertion - already validated above
+            config: { numberOfImages: 1, aspectRatio: DEFAULT_AR },
+            safetySettings: [
+              { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+              { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+              { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+              { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+            ],
+          } as const;
 
-      const image = (imgResult as any)?.generatedImages?.[0];
-      const imageBytesB64 = image?.image?.imageBytes;
+          const imgResult = await googleAI.models.generateImages({ model: IMAGE_MODEL, ...request });
 
-      if (!imageBytesB64) throw new Error('Imagen returned no image data.');
-      const imageBytes = Buffer.from(imageBytesB64, 'base64');
+          const image = (imgResult as any)?.generatedImages?.[0];
+          const imageBytesB64 = image?.image?.imageBytes;
 
-      const filename = `scene_${String(scene.scene).padStart(3, '0')}_${Date.now()}.png`;
-      const file = storage.bucket(imageBucketName).file(filename);
+          if (!imageBytesB64) throw new Error('Imagen returned no image data.');
+          const imageBytes = Buffer.from(imageBytesB64, 'base64');
 
-      await file.save(imageBytes, { contentType: 'image/png' });
+          const filename = `scene_${String(scene.scene).padStart(3, '0')}_${Date.now()}.png`;
+          const file = storage.bucket(imageBucketName).file(filename);
 
-      const publicUrl = `https://storage.googleapis.com/${imageBucketName}/${filename}`;
-      console.log(`Scene ${scene.scene} image saved to: ${publicUrl}`);
+          await file.save(imageBytes, { contentType: 'image/png' });
 
-      finalScenes.push({ ...scene, image_url: publicUrl });
+          const publicUrl = `https://storage.googleapis.com/${imageBucketName}/${filename}`;
+          console.log(`✓ Scene ${scene.scene} image saved to: ${publicUrl}`);
 
-      console.log(`Waiting ${SLEEP_BETWEEN_IMAGES_SEC}s before next image...`);
-      await sleep(SLEEP_BETWEEN_IMAGES_SEC * 1000);
+          return publicUrl;
+        },
+        {
+          maxRetries: 3,
+          initialDelayMs: 2000,
+          maxDelayMs: 30000,
+          shouldRetry: isRetryableError,
+        }
+      );
+
+      // Update the scene with the successful image URL
+      workingScenes[sceneIndex] = { ...scene, image_url: imageUrl };
+
+      // CRITICAL: Save progress incrementally after each successful image
+      console.log(`Saving progress after Scene ${scene.scene}...`);
+      await Promise.all([
+        saveChunkedJson(jobId, workingScenes),
+        saveProgressToTempFile(jobId, workingScenes),
+      ]);
+      console.log(`✓ Progress saved (Scene ${scene.scene} complete)`);
+
+      // Rate limiting: wait before next image
+      if (sceneIndex < scenesToProcess[scenesToProcess.length - 1]) {
+        console.log(`Waiting ${SLEEP_BETWEEN_IMAGES_SEC}s before next image...`);
+        await sleep(SLEEP_BETWEEN_IMAGES_SEC * 1000);
+      }
+
     } catch (error: any) {
-      console.error(`Failed to generate image for Scene ${scene.scene}:`, error?.message || error);
-      finalScenes.push({
+      console.error(`✗ Failed to generate image for Scene ${scene.scene} after all retries:`, error?.message || error);
+
+      // Mark scene with error
+      workingScenes[sceneIndex] = {
         ...scene,
         image_url: `ERROR: ${error?.message || 'Unknown image generation error'}`,
-      });
+      };
+
+      // Save progress even on failure
+      console.log(`Saving progress after Scene ${scene.scene} failure...`);
+      await Promise.all([
+        saveChunkedJson(jobId, workingScenes),
+        saveProgressToTempFile(jobId, workingScenes),
+      ]);
+
+      // Still wait before next attempt to avoid hammering the API
       console.log(`Error encountered. Waiting ${SLEEP_BETWEEN_IMAGES_SEC}s...`);
       await sleep(SLEEP_BETWEEN_IMAGES_SEC * 1000);
     }
   }
 
-  await saveChunkedJson(jobId, finalScenes);
-  console.log('Image generation complete. Final JSON saved.');
-  return finalScenes;
+  // === RETRY LOOP: Ensure ALL images have valid URLs before proceeding ===
+  const RETRY_DELAY_SEC = 30;
+  let retryAttempt = 0;
+  const MAX_OVERALL_RETRIES = 10; // Maximum number of overall retry passes
+
+  while (retryAttempt < MAX_OVERALL_RETRIES) {
+    // Find scenes that don't have valid https URLs
+    const failedSceneIndices: number[] = [];
+    for (let i = 0; i < workingScenes.length; i++) {
+      const scene = workingScenes[i];
+      if (!scene.image_url || !scene.image_url.startsWith('https://')) {
+        failedSceneIndices.push(i);
+      }
+    }
+
+    if (failedSceneIndices.length === 0) {
+      console.log('\n✓ All images generated successfully!');
+      break;
+    }
+
+    retryAttempt++;
+    console.log(`\n=== RETRY PASS ${retryAttempt}/${MAX_OVERALL_RETRIES}: ${failedSceneIndices.length} images need regeneration ===`);
+    console.log(`Waiting ${RETRY_DELAY_SEC}s before retry pass...`);
+    await sleep(RETRY_DELAY_SEC * 1000);
+
+    for (const sceneIndex of failedSceneIndices) {
+      const scene = workingScenes[sceneIndex];
+
+      if (!scene.prompt || scene.prompt.startsWith('Failed to generate')) {
+        console.log(`Skipping Scene ${scene.scene}: No valid prompt provided.`);
+        continue;
+      }
+
+      console.log(`\n=== Retrying Scene ${scene.scene} ===`);
+
+      // Helper function to determine if error is retryable
+      const isRetryableError = (error: any): boolean => {
+        const errorMsg = error?.message || String(error);
+        if (errorMsg.includes('safety') || errorMsg.includes('blocked') || errorMsg.includes('policy')) {
+          return false;
+        }
+        if (errorMsg.includes('authentication') || errorMsg.includes('unauthorized')) {
+          return false;
+        }
+        return true;
+      };
+
+      try {
+        const imageUrl = await retryWithBackoff(
+          async () => {
+            console.log(`Generating image for Scene ${scene.scene}...`);
+
+            const request = {
+              prompt: scene.prompt!,
+              config: { numberOfImages: 1, aspectRatio: DEFAULT_AR },
+              safetySettings: [
+                { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+              ],
+            } as const;
+
+            const imgResult = await googleAI.models.generateImages({ model: IMAGE_MODEL, ...request });
+
+            const image = (imgResult as any)?.generatedImages?.[0];
+            const imageBytesB64 = image?.image?.imageBytes;
+
+            if (!imageBytesB64) throw new Error('Imagen returned no image data.');
+            const imageBytes = Buffer.from(imageBytesB64, 'base64');
+
+            const filename = `scene_${String(scene.scene).padStart(3, '0')}_${Date.now()}.png`;
+            const file = storage.bucket(imageBucketName).file(filename);
+
+            await file.save(imageBytes, { contentType: 'image/png' });
+
+            const publicUrl = `https://storage.googleapis.com/${imageBucketName}/${filename}`;
+            console.log(`✓ Scene ${scene.scene} image saved to: ${publicUrl}`);
+
+            return publicUrl;
+          },
+          {
+            maxRetries: 3,
+            initialDelayMs: 5000,
+            maxDelayMs: 60000,
+            shouldRetry: isRetryableError,
+          }
+        );
+
+        workingScenes[sceneIndex] = { ...scene, image_url: imageUrl };
+
+        // Save progress after each successful retry
+        await Promise.all([
+          saveChunkedJson(jobId, workingScenes),
+          saveProgressToTempFile(jobId, workingScenes),
+        ]);
+        console.log(`✓ Progress saved (Scene ${scene.scene} complete)`);
+
+        // Wait before next image
+        console.log(`Waiting ${SLEEP_BETWEEN_IMAGES_SEC}s before next image...`);
+        await sleep(SLEEP_BETWEEN_IMAGES_SEC * 1000);
+
+      } catch (error: any) {
+        console.error(`✗ Failed to regenerate Scene ${scene.scene}:`, error?.message || error);
+        workingScenes[sceneIndex] = {
+          ...scene,
+          image_url: `ERROR: ${error?.message || 'Unknown image generation error'}`,
+        };
+
+        await Promise.all([
+          saveChunkedJson(jobId, workingScenes),
+          saveProgressToTempFile(jobId, workingScenes),
+        ]);
+
+        console.log(`Waiting ${SLEEP_BETWEEN_IMAGES_SEC}s before next...`);
+        await sleep(SLEEP_BETWEEN_IMAGES_SEC * 1000);
+      }
+    }
+  }
+
+  // Final check - warn if still have failed images (will use black placeholders in video)
+  const stillFailedCount = workingScenes.filter(s => !s.image_url || !s.image_url.startsWith('https://')).length;
+  if (stillFailedCount > 0) {
+    console.warn(`\n⚠ ${stillFailedCount} images still failed after ${MAX_OVERALL_RETRIES} retry passes.`);
+    console.warn('Proceeding to video generation - failed scenes will use black placeholder images.');
+  }
+
+  // Clean up temp file on completion
+  await cleanupTempFile(jobId);
+
+  console.log('\n=== Image generation complete ===');
+  console.log(`Total scenes: ${workingScenes.length}`);
+  console.log(`Successful: ${workingScenes.filter(s => s.image_url && s.image_url.startsWith('https://')).length}`);
+  console.log(`Failed: ${workingScenes.filter(s => !s.image_url || !s.image_url.startsWith('https://')).length}`);
+
+  return workingScenes;
 }
 
 // STEP 5: GENERATE VIDEO
@@ -503,26 +814,50 @@ async function runStep5_CreateVideo(
     const audioFileName = audioFileParts.join('/');
     await downloadGCSFile(audioBucket, audioFileName, localAudioPath);
 
+    // Create a black placeholder image for missing scenes
+    const placeholderPath = path.join(TEMP_DIR, 'placeholder_black.png');
+    console.log('Creating black placeholder image...');
+    await new Promise<void>((resolve, reject) => {
+      ffmpeg()
+        .input('color=black:s=1920x1080:d=1')
+        .inputOptions(['-f', 'lavfi'])
+        .outputOptions(['-frames:v', '1'])
+        .on('error', (err) => reject(new Error(`Failed to create placeholder: ${err.message}`)))
+        .on('end', () => resolve())
+        .save(placeholderPath);
+    });
+    console.log('Placeholder image created.');
+
     let inputsTxtContent = '';
     const localImagePaths: string[] = [];
     let lastImageFileName: string | null = null;
 
     for (const scene of scenes) {
-      if (!scene.image_url) continue;
-
-      const imageUrl = new URL(scene.image_url);
-      const imageFileName = path.basename(imageUrl.pathname);
-      const localImagePath = path.join(TEMP_DIR, imageFileName);
-
-      await downloadGCSFile(imageBucketName, imageFileName, localImagePath);
-
       const duration = Math.max(0.05, scene.end_time_secs - scene.start_time_secs);
 
-      inputsTxtContent += `file '${imageFileName}'\n`;
-      inputsTxtContent += `duration ${duration.toFixed(3)}\n`;
+      // Check if scene has a valid image URL
+      if (scene.image_url && scene.image_url.startsWith('https://')) {
+        // Download the actual image
+        const imageUrl = new URL(scene.image_url);
+        const imageFileName = path.basename(imageUrl.pathname);
+        const localImagePath = path.join(TEMP_DIR, imageFileName);
 
-      lastImageFileName = imageFileName;
-      localImagePaths.push(localImagePath);
+        await downloadGCSFile(imageBucketName, imageFileName, localImagePath);
+
+        inputsTxtContent += `file '${imageFileName}'\n`;
+        inputsTxtContent += `duration ${duration.toFixed(3)}\n`;
+
+        lastImageFileName = imageFileName;
+        localImagePaths.push(localImagePath);
+      } else {
+        // Use black placeholder for missing/failed images
+        console.warn(`Scene ${scene.scene}: Using black placeholder (no valid image)`);
+
+        inputsTxtContent += `file 'placeholder_black.png'\n`;
+        inputsTxtContent += `duration ${duration.toFixed(3)}\n`;
+
+        lastImageFileName = 'placeholder_black.png';
+      }
     }
 
     // Concat demuxer requires the last file listed again without duration
@@ -574,32 +909,35 @@ async function runStep5_CreateVideo(
 export async function generateStoryboard(formData: FormData) {
   try {
     // ===================================================================
-    // =================== DEBUG: START FROM STEP 5 =========================
+    // =================== DEBUG: RESUME FROM STEP 4 =========================
     // ===================================================================
-    // console.warn('!!!!!!!!!! RUNNING IN DEBUG MODE: STARTING FROM STEP 5 !!!!!!!!!!!');
+    // console.warn('!!!!!!!!!! RUNNING IN DEBUG MODE: RESUMING FROM STEP 4 !!!!!!!!!!!');
 
-    // const debugJobId = 'final_1764653265533';
-    // const debugChunkedJsonFile = 'final_1764653265533.json';
+    // const debugJobId = 'final-tl_1765680383499';
+    // const debugChunkedJsonFile = 'final-tl_1765680383499.json';
 
     // console.log(`DEBUG: Fetching chunked JSON: gs://${chunkedBucketName}/${debugChunkedJsonFile}`);
 
     // const jsonFile = storage.bucket(chunkedBucketName).file(debugChunkedJsonFile);
     // const [jsonData] = await jsonFile.download();
 
-    // const debugFinalScenes = JSON.parse(jsonData.toString('utf-8')) as Scene[];
-    // console.log(`DEBUG: Loaded ${debugFinalScenes.length} scenes from JSON.`);
+    // const debugScenesWithPrompts = JSON.parse(jsonData.toString('utf-8')) as Scene[];
+    // console.log(`DEBUG: Loaded ${debugScenesWithPrompts.length} scenes from JSON.`);
 
-    // if (debugFinalScenes.length === 0) {
+    // if (debugScenesWithPrompts.length === 0) {
     //   throw new Error('Debug JSON file was empty or invalid.');
     // }
 
     // // We need the audio file. Assuming .wav. If your file is .mp3, change this line.
     // const debugGcsAudioUri = `gs://${audioBucketName}/${debugJobId}.wav`;
 
+    // console.log('DEBUG: Running Step 4 (Generate Images) - will resume from saved progress...');
+    // const debugFinalScenes = await runStep4_GenerateImages(debugJobId, debugScenesWithPrompts);
+
     // console.log('DEBUG: Running Step 5 (Create Video)...');
     // const debugVideoUrl = await runStep5_CreateVideo(debugJobId, debugFinalScenes, debugGcsAudioUri);
 
-    // console.log('--- DEBUG STORYBOARD PIPELINE COMPLETE (Step 5) ---');
+    // console.log('--- DEBUG STORYBOARD PIPELINE COMPLETE (Step 4 + 5) ---');
     // return { scenes: debugFinalScenes, video: debugVideoUrl };
 
     // ===================================================================

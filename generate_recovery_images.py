@@ -13,7 +13,7 @@ LOCATION = "us-central1"
 IMAGE_BUCKET_NAME = "sb_script_images"
 
 # The path to your JSON file
-JSON_FILE_PATH = r"C:\Users\Karthik\Downloads\final_1764653265533.json"
+JSON_FILE_PATH = r"C:\Users\Karthik\Downloads\final-voice_1765015097153.json"
 # Directory to save generated images locally
 OUTPUT_DIR = "recovered_images"
 
@@ -147,8 +147,8 @@ def main():
                 updated_count += 1
                 
                 # Sleep to avoid rate limits
-                print("Sleeping for 30 seconds...")
-                time.sleep(30)
+                print("Sleeping for 10 seconds...")
+                time.sleep(10)
             else:
                 print(f"Failed to generate image for Scene {scene_id}")
 
